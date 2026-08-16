@@ -39,6 +39,7 @@ export function ComputerMark({ size = 16, className }: IconProps) {
 export function ProviderMark({ driverKind, size, className }: IconProps & { driverKind: string }) {
   switch (driverKind) {
     case "grok":
+    case "grokAgent":
       return <GrokMark size={size} className={className} />;
     case "claudeAgent":
       return <ClaudeMark size={size} className={className} />;
@@ -46,6 +47,8 @@ export function ProviderMark({ driverKind, size, className }: IconProps & { driv
       return <CodexMark size={size} className={className} />;
     case "boxAgent":
       return <ComputerMark size={size} className={className} />;
+    case "opencodeGo":
+      return <span className="text-[10px] font-semibold tracking-tight text-ink-secondary">OC</span>;
     default:
       return <span className="text-[11px] font-semibold text-ink-secondary">{driverKind.slice(0, 2).toUpperCase()}</span>;
   }

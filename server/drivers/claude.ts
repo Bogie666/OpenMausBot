@@ -8,15 +8,15 @@
 //   - Composio Connect (connected apps → tools) over streamable HTTP
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
-import { spawn } from "node:child_process";
-import { execFile } from "node:child_process";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DATA_DIR } from "../config.ts";
+import { augmentedPath } from "../env-path.ts";
+import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -27,8 +27,50 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
+import { computerProxyEnv } from "../container-computer.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+
+/** Whether `claude` has been signed in.
+ *
+ * Credential storage is deliberately not inspected here. Claude Code uses the
+ * macOS Keychain for OAuth, a JSON file on some platforms, and may gain other
+ * backends over time. Presence checks also accept stale credentials. The CLI's
+ * own machine-readable auth command is the source of truth for every backend.
+ */
+export function claudeSignedIn(
+  cli: string,
+  env: NodeJS.ProcessEnv,
+  run: typeof execCli = execCli,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    run(cli, ["auth", "status", "--json"], { timeout: 8000, env }, (_error, stdout) => {
+      try {
+        const status: unknown = JSON.parse(stdout);
+        resolve(
+          typeof status === "object" && status !== null && "loggedIn" in status && status.loggedIn === true,
+        );
+      } catch {
+        resolve(false);
+      }
+    });
+  });
+}
+
+/** The CLI environment shared by auth probes and real turns.
+ *
+ * Subscription users can be billed pay-as-you-go if an inherited API key
+ * leaks through, and a nested CLI must not inherit this session's identity.
+ * Keeping the probe and turn environments identical prevents setup from
+ * claiming an API-key login that the turn itself would deliberately remove.
+ */
+function claudeEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  return env;
+}
 
 const DRIVER_KIND = "claudeAgent";
 
@@ -56,6 +98,7 @@ const proxyPath = (basename: string) => {
 };
 const PROXY_PATH = proxyPath("computer-proxy");
 const PERM_PROXY_PATH = proxyPath("permission-proxy");
+const DWEB_PROXY_PATH = proxyPath("drivers/dweb-proxy");
 // in the packaged app process.execPath is the Electron binary — this env
 // makes it behave as plain node for the spawned MCP proxies (harmless in dev)
 const NODE_ENV_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
@@ -89,9 +132,9 @@ function askSummary(ask: Ask): string {
   return text === "{}" ? (ask.tool ?? "tool") : text.slice(0, 200);
 }
 
-function permissionSocketPath(threadId: string) {
+export function permissionSocketPath(threadId: string) {
   const tag = threadId.replace(/[^\w-]/g, "").slice(0, 8);
-  return join(DATA_DIR, `perm-${tag}.sock`);
+  return brokerSocketPath(DATA_DIR, tag);
 }
 
 function createPermissionBroker(opts: {
@@ -145,7 +188,12 @@ function createPermissionBroker(opts: {
       }
     });
   });
-  server.on("error", () => {});
+  // A broker that never came up used to be silent — every approval then
+  // timed out into a deny nobody could explain. Keep the turn fail-closed,
+  // but leave an actionable diagnostic.
+  server.on("error", (error) => {
+    console.error(`permission broker unavailable on ${opts.socketPath}: ${error.message}`);
+  });
   server.listen(opts.socketPath);
   return {
     answer(askId: string, behavior: string, message?: string): boolean {
@@ -197,6 +245,18 @@ function firstText(content: unknown): string {
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "Claude", supportsMultipleInstances: true },
+  // npm on all three: the one recipe that is genuinely cross-platform. The
+  // native installers differ per OS and would need verifying separately.
+  install: {
+    command: {
+      darwin: "npm install -g @anthropic-ai/claude-code",
+      linux: "npm install -g @anthropic-ai/claude-code",
+      win32: "npm install -g @anthropic-ai/claude-code",
+    },
+    needsNode: true,
+    docsUrl: "https://claude.com/claude-code",
+    signInCommand: "claude",
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -230,11 +290,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         "--output-format", "stream-json",
         "--input-format", "stream-json",
         "--verbose", // required by stream-json output
+        // token-level streaming: content_block_delta events between the
+        // whole-message frames, so the bubble grows as the model writes
+        "--include-partial-messages",
         "--permission-mode", config.permissionMode === "auto" ? "acceptEdits" : config.permissionMode,
       ];
       if (sessionId) args.push("--resume", sessionId);
       else args.push("--session-id", newSessionId!);
       if (turn.model) args.push("--model", turn.model);
+      if (turn.effort) args.push("--effort", turn.effort);
       if (turn.system) args.push("--append-system-prompt", turn.system);
 
       // integrations → MCP servers; pre-allow their tools (a headless
@@ -253,19 +317,36 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.computer = {
           command: process.execPath,
           args: [PROXY_PATH],
-          env: {
-            ...NODE_ENV_FLAG,
-            OGB_BOX_ID: turn.integrations.computer.boxId,
-            OGB_BOX_TOKEN: turn.integrations.computer.token,
-          },
+          env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
         };
         allowed.push("mcp__computer");
       } else if (turn.integrations?.localComputer) {
-        // this Mac, via the Electron-owned cua-driver daemon (spawn config
-        // read from cua-connection.json — same "computer" name either way,
-        // the agent just sees a computer)
+        // A direct Cua Driver MCP connection. This can be the Electron-owned
+        // host daemon or the isolated Local VM; the agent sees the same
+        // "computer" server either way.
         mcpServers.computer = { ...turn.integrations.localComputer };
         allowed.push("mcp__computer");
+      }
+      // peer-agent comms (list_bots/ask_bot) — the harness builds the whole
+      // spawn contract (command/args/env incl. the boot token) in
+      // agentsIntegration(); pre-allowing matters doubly here, or the CLI's
+      // own ListAgents look-alike shadows it and "@Bot" asks go nowhere
+      if (turn.integrations?.agents) {
+        mcpServers.agents = { ...turn.integrations.agents };
+        allowed.push("mcp__agents");
+      }
+      // dweb network daemon (status / repo / opencode model access) via
+      // server/drivers/dweb-proxy.ts — points at the configured dweb instance
+      if (turn.integrations?.dweb) {
+        mcpServers.dweb = {
+          command: process.execPath,
+          args: [DWEB_PROXY_PATH],
+          env: {
+            ...NODE_ENV_FLAG,
+            DWEB_URL: turn.integrations.dweb.url,
+          },
+        };
+        allowed.push("mcp__dweb");
       }
       // permission broker: anything acceptEdits would silently deny becomes
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
@@ -298,23 +379,26 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG } };
         allowed.push("mcp__ogb");
       }
+      // The MCP config carries credentials — a Composio consumer key in a
+      // header, the box token in the computer proxy's env, the comms token in
+      // the agents proxy's env. On argv every one of those is world-readable
+      // through `ps` for the life of the turn, to any local process. The CLI
+      // accepts a FILE for this flag, so the secrets go in a 0600 file that
+      // is removed when the turn settles.
+      let mcpConfigPath: string | null = null;
       if (Object.keys(mcpServers).length) {
-        args.push("--mcp-config", JSON.stringify({ mcpServers }));
+        mcpConfigPath = join(mkdtempSync(join(tmpdir(), "omb-mcp-")), "mcp.json");
+        writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+        args.push("--mcp-config", mcpConfigPath);
         args.push("--allowedTools", allowed.join(","));
       }
 
-      const env: Record<string, string | undefined> = { ...process.env, NPM_CONFIG_LOGLEVEL: "error" };
-      // subscription users get billed pay-as-you-go if this leaks through;
-      // and a nested CLI must not inherit this session's identity (agentcal)
-      delete env.ANTHROPIC_API_KEY;
-      delete env.CLAUDECODE;
-      delete env.CLAUDE_CODE_ENTRYPOINT;
+      const env = claudeEnvironment();
 
-      const child = spawn(config.cli, args, {
+      const child = spawnCli(config.cli, args, {
         cwd: turn.cwd ?? homedir(),
         env,
         stdio: ["pipe", "pipe", "pipe"],
-        detached: true, // own process group: killing -pid reaps child MCP servers
       });
 
       let settled = false;
@@ -322,9 +406,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (settled) return;
         settled = true;
         broker?.close();
+        // the config file holds live credentials — it must not outlive the turn
+        if (mcpConfigPath) {
+          try {
+            rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
+          } catch {}
+        }
         active.delete(threadId);
         emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost });
       };
+
+      // token streaming: true while --include-partial-messages is delivering
+      // text deltas for the current assistant message, so the whole-message
+      // frame that follows doesn't re-emit the same text as one big delta
+      let sawStreamDelta = false;
 
       const handleLine = (line: string) => {
         let o: any;
@@ -342,11 +437,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: o.estimated_tokens });
             }
             break;
+          case "stream_event": {
+            // subagent narration is dropped — N parallel Tasks would
+            // interleave their prose into one bubble (upstream-verified bug)
+            if (o.parent_tool_use_id) break;
+            const ev = o.event ?? {};
+            if (ev.type !== "content_block_delta") break;
+            const d = ev.delta ?? {};
+            if (d.type === "text_delta" && typeof d.text === "string" && d.text) {
+              sawStreamDelta = true;
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: d.text });
+            } else if (d.type === "thinking_delta" && typeof d.thinking === "string" && d.thinking) {
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta: d.thinking });
+            }
+            break;
+          }
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
             if (text.trim()) {
-              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: text });
+              // fallback delta for CLIs/paths that never streamed the block
+              if (!sawStreamDelta) {
+                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: text });
+              }
+              sawStreamDelta = false;
               emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
@@ -378,6 +492,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       };
 
       let buf = "";
+      // decode as UTF-8 across chunk boundaries — a raw `buf += chunk` splits
+      // multibyte characters that straddle two reads and corrupts the text
+      child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk) => {
         buf += chunk;
         let nl;
@@ -395,7 +512,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
 
       child.on("error", (e) => {
-        emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
+        emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
 
@@ -410,15 +527,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
       });
 
-      const stop = () => {
-        try {
-          process.kill(-child.pid!, "SIGTERM");
-        } catch {
-          try {
-            child.kill("SIGTERM");
-          } catch {}
-        }
-      };
+      const stop = () => killCliTree(child);
       active.set(threadId, { stop, turnId, broker });
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
@@ -432,13 +541,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
+      const env = claudeEnvironment();
       const version = await new Promise<string | null>((resolve) => {
-        execFile(config.cli, ["--version"], { timeout: 8000 }, (err, stdout) =>
+        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
           resolve(err ? null : stdout.trim()),
         );
       });
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-      const authenticated = existsSync(join(homedir(), ".claude", ".credentials.json"));
+      const authenticated = await claudeSignedIn(config.cli, env);
       return { state: "available", version, authenticated };
     };
 
@@ -451,7 +561,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          computerMcp: true,
+          composioMcp: true,
+          effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),
         respondToRequest: async (threadId, requestId, decision) => {
@@ -473,10 +589,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       },
       generateText: (prompt: string) =>
         new Promise((resolve, reject) => {
-          execFile(
+          execCli(
             config.cli,
             ["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"],
-            { timeout: 60_000, env: { ...process.env } },
+            { timeout: 60_000, env: { ...process.env, PATH: augmentedPath() } },
             (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
           );
         }),

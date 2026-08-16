@@ -9,9 +9,10 @@
 //
 // resumeCursor is the codex thread id; a later turn tries thread/resume
 // and falls back to a fresh thread/start.
-import { spawn, execFile } from "node:child_process";
 import { homedir } from "node:os";
+import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.js";
 import { newEventId, newId } from "../contracts.js";
+import { augmentedPath } from "../env-path.js";
 import { appendNative } from "./native.js";
 const DRIVER_KIND = "codex";
 // catalog ported from upstream packages/contracts/src/model.ts
@@ -35,6 +36,16 @@ const DENY_TIMEOUT_NOTE = "OpenMausBot: nobody answered this permission request 
 export const CodexDriver = {
     driverKind: DRIVER_KIND,
     metadata: { displayName: "Codex", supportsMultipleInstances: true },
+    install: {
+        command: {
+            darwin: "npm install -g @openai/codex",
+            linux: "npm install -g @openai/codex",
+            win32: "npm install -g @openai/codex",
+        },
+        needsNode: true,
+        docsUrl: "https://github.com/openai/codex",
+        signInCommand: "codex",
+    },
     models: MODELS,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
@@ -58,17 +69,16 @@ export const CodexDriver = {
             if (active.has(threadId))
                 throw new Error("a turn is already running on this thread");
             const turnId = newId();
-            const env = { ...process.env, NPM_CONFIG_LOGLEVEL: "error" };
+            const env = { ...process.env, PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" };
             // the CLI owns its own ChatGPT login; a leaked API key silently flips
             // billing to pay-as-you-go (agentcal)
             delete env.OPENAI_API_KEY;
-            const child = spawn(config.cli, ["app-server"], {
+            const child = spawnCli(config.cli, ["app-server"], {
                 cwd: turn.cwd ?? homedir(),
                 env,
                 stdio: ["pipe", "pipe", "pipe"],
-                detached: true,
             });
-            const state = { settled: false, lastText: "" };
+            const state = { settled: false, lastText: "", sawStreamDelta: false };
             const asks = new Map();
             let nextId = 1;
             const rpcPending = new Map();
@@ -79,22 +89,29 @@ export const CodexDriver = {
                 catch { }
                 appendNative(threadId, { dir: "out", source: "codex.app-server", msg: obj });
             };
-            const request = (method, params) => new Promise((resolve, reject) => {
+            const request = (method, params, timeoutMs = 60_000) => new Promise((resolve, reject) => {
                 const id = nextId++;
-                rpcPending.set(id, { resolve, reject });
+                // a wedged app-server can accept stdin and never reply; without this
+                // the handshake await hangs forever and the bot stays busy for good
+                const timer = setTimeout(() => {
+                    if (rpcPending.delete(id))
+                        reject(new Error(`codex ${method} timed out after ${timeoutMs}ms`));
+                }, timeoutMs);
+                if (typeof timer.unref === "function")
+                    timer.unref();
+                rpcPending.set(id, {
+                    resolve: (v) => {
+                        clearTimeout(timer);
+                        resolve(v);
+                    },
+                    reject: (e) => {
+                        clearTimeout(timer);
+                        reject(e);
+                    },
+                });
                 send({ jsonrpc: "2.0", id, method, params });
             });
-            const stop = () => {
-                try {
-                    process.kill(-child.pid, "SIGTERM");
-                }
-                catch {
-                    try {
-                        child.kill("SIGTERM");
-                    }
-                    catch { }
-                }
-            };
+            const stop = () => killCliTree(child);
             const settle = (ok, stopReason) => {
                 if (state.settled)
                     return;
@@ -169,6 +186,23 @@ export const CodexDriver = {
             const handleNotification = (msg) => {
                 const p = msg.params ?? {};
                 switch (msg.method) {
+                    // token-level chat text; the item/completed frame follows with the
+                    // whole message, so its delta is only a fallback when none streamed
+                    case "item/agentMessage/delta": {
+                        const delta = typeof p.delta === "string" ? p.delta : "";
+                        if (delta) {
+                            state.sawStreamDelta = true;
+                            emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+                        }
+                        break;
+                    }
+                    case "item/reasoning/textDelta":
+                    case "item/reasoning/summaryTextDelta": {
+                        const delta = typeof p.delta === "string" ? p.delta : "";
+                        if (delta)
+                            emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta });
+                        break;
+                    }
                     case "item/started": {
                         const item = p.item ?? {};
                         const title = item.type === "commandExecution"
@@ -189,7 +223,10 @@ export const CodexDriver = {
                         if (item.type === "agentMessage") {
                             if (item.text?.trim()) {
                                 state.lastText = item.text;
-                                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: item.text });
+                                if (!state.sawStreamDelta) {
+                                    emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: item.text });
+                                }
+                                state.sawStreamDelta = false;
                                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
                             }
                         }
@@ -225,12 +262,20 @@ export const CodexDriver = {
                         break;
                     }
                     case "error":
-                        if (p.message)
-                            emit({ ...base(threadId, turnId), type: "runtime.error", message: p.message });
+                        // shape drift: 0.144 sends {message}, 0.139 nests it under
+                        // {error:{message}} — surface either (agentcal armor)
+                        {
+                            const message = p.message ?? p.error?.message;
+                            if (message)
+                                emit({ ...base(threadId, turnId), type: "runtime.error", message: String(message).slice(0, 400) });
+                        }
                         break;
                 }
             };
             let buf = "";
+            // decode as UTF-8 across chunk boundaries — a raw `buf += chunk` splits
+            // multibyte characters that straddle two reads and corrupts the text
+            child.stdout.setEncoding("utf8");
             child.stdout.on("data", (chunk) => {
                 buf += chunk;
                 let nl;
@@ -269,7 +314,7 @@ export const CodexDriver = {
                     stderr = stderr.slice(-8192);
             });
             child.on("error", (e) => {
-                emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
+                emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
                 settle(false, "spawn_error");
             });
             child.on("close", (code) => {
@@ -316,6 +361,16 @@ export const CodexDriver = {
                     await request("turn/start", {
                         threadId: codexThreadId,
                         input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+                        // Spread, not `effort: turn.effort ?? null`. Probed against
+                        // codex-cli 0.146.0: null is indistinguishable from an absent key
+                        // — both leave the thread's current effort alone, emitting no
+                        // thread/settings/updated, and thread/resume reads the old value
+                        // back. The app-server offers no way to clear a level either:
+                        // "" is rejected outright and thread/start takes no effort at
+                        // all. So a thread keeps the last level it was sent until it is
+                        // sent another, and choosing Default lands on the bot's next new
+                        // thread rather than the current one.
+                        ...(turn.effort ? { effort: turn.effort } : {}),
                     });
                 }
                 catch (e) {
@@ -329,7 +384,7 @@ export const CodexDriver = {
         };
         const snapshot = async () => {
             const version = await new Promise((resolve) => {
-                execFile(config.cli, ["--version"], { timeout: 8000 }, (err, stdout) => resolve(err ? null : stdout.trim()));
+                execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) => resolve(err ? null : stdout.trim()));
             });
             if (!version)
                 return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
@@ -344,7 +399,10 @@ export const CodexDriver = {
             snapshot,
             adapter: {
                 provider: DRIVER_KIND,
-                capabilities: { sessionModelSwitch: "unsupported" },
+                capabilities: {
+                    sessionModelSwitch: "unsupported",
+                    effortLevels: ["low", "medium", "high", "xhigh", "max"],
+                },
                 sendTurn,
                 interruptTurn: async (threadId) => active.get(threadId)?.stop(),
                 respondToRequest: async (threadId, requestId, decision) => {
